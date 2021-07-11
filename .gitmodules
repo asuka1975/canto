@@ -1,0 +1,3 @@
+[submodule "glplusplus"]
+	path = glplusplus
+	url = https://github.com/asuka1975/glplusplus.git
