@@ -3,6 +3,7 @@
 //
 #include <canto/font.h>
 
+#include <algorithm>
 #include <list>
 #include <map>
 #include <unordered_map>
@@ -86,26 +87,31 @@ namespace {
     std::map<std::string, FT_Long> index_pool;
 
     FT_Long get_index(const std::string& path);
+
+    std::tuple<std::vector<outline_t>, std::vector<glm::vec2>, float> load_char(char16_t c, canto::face& face);
 }
 
 struct canto::font::font_resource {
+    std::unordered_map<char16_t, offset_t> offsets;
     gl::vertex_buffer<gl::buffer_trait<outline_t, GL_ARRAY_BUFFER, GL_DYNAMIC_DRAW>> outline_vbo;
     gl::vertex_buffer<gl::buffer_trait<glm::vec2, GL_ARRAY_BUFFER, GL_DYNAMIC_DRAW>> box_vbo;
     std::vector<float> width;
-    std::unordered_map<char16_t, offset_t> offsets;
 
-    explicit font_resource(const std::tuple<std::vector<outline_t>, std::vector<glm::vec2>>& data);
+    explicit font_resource(const std::tuple<std::vector<outline_t>, std::vector<glm::vec2>, std::vector<float>, std::unordered_map<char16_t, offset_t>>& data);
     explicit font_resource(canto::face& face);
-    std::tuple<std::vector<outline_t>, std::vector<glm::vec2>> load_default_chars(canto::face& face);
+private:
+    static std::tuple<std::vector<outline_t>, std::vector<glm::vec2>, std::vector<float>, std::unordered_map<char16_t, offset_t>> load_default_chars(canto::face& face);
 };
 
 canto::font::font(const std::string &path) : m_face(*canto::library::get_library(), path, get_index(path)), resource(std::make_unique<font_resource>(m_face)) {
 
 }
 
-canto::font::font_resource::font_resource(const std::tuple<std::vector<outline_t>, std::vector<glm::vec2>>& data) :
+canto::font::font_resource::font_resource(const std::tuple<std::vector<outline_t>, std::vector<glm::vec2>, std::vector<float>, std::unordered_map<char16_t, offset_t>>& data) :
+                                          offsets(std::get<3>(data)),
                                           outline_vbo(std::get<0>(data).begin(), std::get<0>(data).end()),
-                                          box_vbo(std::get<1>(data).begin(), std::get<1>(data).end()) {
+                                          box_vbo(std::get<1>(data).begin(), std::get<1>(data).end()),
+                                          width(std::get<2>(data)) {
 
 }
 
@@ -113,13 +119,22 @@ canto::font::font_resource::font_resource(canto::face& face) : font_resource(loa
 
 }
 
-// TODO: implement load_default_chars
-std::tuple<std::vector<outline_t>, std::vector<glm::vec2>>
+std::tuple<std::vector<outline_t>, std::vector<glm::vec2>, std::vector<float>, std::unordered_map<char16_t, offset_t>>
 canto::font::font_resource::load_default_chars(canto::face& face) {
+    std::unordered_map<char16_t, offset_t> offsets_;
     std::vector<outline_t> outlines;
     std::vector<glm::vec2> boxes;
     std::vector<float> widths;
-    return std::tuple<std::vector<outline_t>, std::vector<glm::vec2>>();
+    for(char16_t c = 0; c < 128; c++) {
+        if(!std::isprint(c) && c == ' ') continue;
+
+        auto [outline, box, width] = load_char(c, face);
+        offsets_.emplace(c, offset_t { static_cast<ptrdiff_t>(outlines.size()), outline.size(), static_cast<ptrdiff_t>(offsets_.size()) });
+        outlines.insert(outlines.end(), outline.begin(), outline.end());
+        boxes.insert(boxes.end(), box.begin(), box.end());
+        widths.push_back(width);
+    }
+    return std::make_tuple(outlines, boxes, widths, offsets_);
 }
 
 namespace {
@@ -191,6 +206,39 @@ namespace {
 
     glm::vec2 &path::back() {
         return outer.back().vertex;
+    }
+
+    std::tuple<std::vector<outline_t>, std::vector<glm::vec2>, float> load_char(char16_t c, canto::face& face) {
+        std::vector<outline_t> vertexes;
+        std::vector<glm::vec2> box;
+
+        FT_Load_Glyph(*face, FT_Get_Char_Index(*face, c), FT_LOAD_NO_SCALE | FT_LOAD_NO_BITMAP);
+        auto& outline = face->glyph->outline;
+        std::ptrdiff_t start = vertexes.size();
+        path p { face->bbox };
+        FT_Outline_Decompose(&outline, &funcs, &p);
+        vertexes.insert(vertexes.end(), p.outer.begin(), p.outer.end());
+        for(auto& u : p.inner) {
+            for(std::size_t i = 1; i < u.size() - 1; i++) {
+                vertexes.push_back(outline_t { u[0], { 0.5, 0.5 } });
+                vertexes.push_back(outline_t { u[i], { 0.5, 0.5 } });
+                vertexes.push_back(outline_t { u[i + 1], { 0.5, 0.5 } });
+            }
+        }
+        auto max_height = static_cast<float>(face->bbox.yMax - face->bbox.yMin);
+        auto xmin = std::min_element(vertexes.begin() + start / 2, vertexes.begin() + vertexes.size() / 2, [](auto& p1, auto& p2) { return p1.vertex.x < p2.vertex.x; })->vertex.x;
+        auto xmax = std::max_element(vertexes.begin() + start / 2, vertexes.begin() + vertexes.size() / 2, [](auto& p1, auto& p2) { return p1.vertex.x < p2.vertex.x; })->vertex.x;
+        auto ymin = std::min_element(vertexes.begin() + start / 2, vertexes.begin() + vertexes.size() / 2, [](auto& p1, auto& p2) { return p1.vertex.y < p2.vertex.y; })->vertex.y;
+        auto ymax = std::max_element(vertexes.begin() + start / 2, vertexes.begin() + vertexes.size() / 2, [](auto& p1, auto& p2) { return p1.vertex.y < p2.vertex.y; })->vertex.y;
+
+        box.emplace_back(xmin, ymax);
+        box.emplace_back(xmax, ymax);
+        box.emplace_back(xmin, ymin);
+        box.emplace_back(xmax, ymin);
+
+        float width = static_cast<float>(face->glyph->metrics.horiAdvance) / max_height;
+
+        return std::make_tuple(std::move(vertexes), std::move(box), width);
     }
 }
 
